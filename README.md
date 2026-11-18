@@ -3,6 +3,8 @@
 电台语料采集工具：把直播 HLS 流录成连续录音包，交给离线转写。
 FastAPI + SQLite 采集网页，输入媒体清单地址即开始追随录制；停止后把应收片段
 全部落盘，产出可离线播放的 ZIP（本地 M3U8 + 原始 TS 片段，不引用远端）。
+完成录音还可在网页上按秒数区间遮蔽敏感内容，流式解码 TS 音轨并生成连续的
+消音 WAV 供下载。
 
 ## 运行
 
@@ -12,8 +14,9 @@ docker compose up --build
 # 直播源: http://localhost:8080
 ```
 
-网页中可开始录制、停止、查看进度、下载 ZIP。直播源地址示例
-（网页内也有提示）：
+网页中可开始录制、停止、查看进度、下载 ZIP；对**已完成**的录音还可填写
+按录音起点计的秒数区间（如 `12.5-18, 30-33.2`），生成并下载消音 WAV。
+直播源地址示例（网页内也有提示）：
 
 | 用途 | 地址 |
 |---|---|
@@ -42,7 +45,17 @@ docker compose up --build
   重启时对账磁盘与 DB——已落盘未登记的片段收养为完成，登记完成但文件丢失
   的重新下载；已保存片段即使滑出清单也保留并入包。
 - **并发**：每路录制为独立的异步轮询 + 下载任务（asyncio/httpx），支持两路
-  （及以上）同时录制；慢下载不阻塞另一路、停止受理与查询。
+  （及以上）同时录制；慢下载不阻塞另一路、停止受理与查询。消音构建在线程池
+  内执行（ffmpeg 子进程 + 分块管道），不阻塞事件循环与网页响应。
+- **消音 WAV**：仅对 `done` 录音开放。按 ZIP 内 `playlist.m3u8` 的清单顺序
+  逐段用 ffmpeg 解码 TS 音轨为 44.1kHz/16bit/单声道 PCM，按**累计 PCM 样本
+  位置**把请求区间（自录音起点计的秒数，可跨片段、可重叠、可超出结尾）置零，
+  未遮蔽样本逐字节保持原值，产出一个连续 WAV。全程分块流式处理（64KB 管道
+  + 固定大小缓冲），长录音不会一次载入内存。临时文件写满并 fsync 后才原子
+  rename 发布；源包缺段、片段为空、ffmpeg 解码失败，或构建期间源 ZIP 被改写
+  （大小/mtime/inode 快照变化）一律判失败：不发布音频、删除半成品、请求记为
+  `failed` 且不可下载，原 ZIP 下载不受影响。处理中重启会把遗留请求判失败并
+  清理 `.part` 文件。
 
 ## API
 
@@ -50,16 +63,24 @@ docker compose up --build
 - `POST /api/jobs/{id}/stop` 停止（固定边界）
 - `GET /api/jobs` / `GET /api/jobs/{id}` 进度（状态、窗口、缺段、错误）
 - `GET /api/jobs/{id}/download` 下载 ZIP（未完成返回 409）
+- `POST /api/jobs/{id}/mute` `{intervals:[{start,end},...]}` 提交消音（秒，
+  仅完成录音；返回 201 与消音任务，状态 `processing → ready/failed`）
+- `GET /api/jobs/{id}/mutes` 该录音的全部消音请求
+- `GET /api/mutes/{mid}` 单个消音请求状态（含总/置零样本数、截断提示）
+- `GET /api/mutes/{mid}/download` 下载消音 WAV（未就绪/失败返回 409）
 
 任务状态：`recording` →（停止）→ `finalizing` → `done` / `failed`。
+消音状态：`processing` → `ready` / `failed`（失败原因在 `error` 字段）。
 
 ## 目录
 
 ```
 app/          采集网页与录制引擎（FastAPI）
-  src/playlist.py   严格清单解析与校验
-  src/recorder.py   轮询、下载、定界、打包、重启恢复
-  src/db.py         SQLite 进度存储
+  src/playlist.py     严格清单解析与校验
+  src/recorder.py     轮询、下载、定界、打包、重启恢复
+  src/mute.py         流式 TS→PCM 解码、按累计样本位置置零、WAV 打包与篡改检测
+  src/mute_manager.py 消音线程池、原子发布、失败清理与重启对账
+  src/db.py           SQLite 进度存储（含 mute_jobs 表）
 livesource/   本地伪直播源（滑窗/延迟/缺段/跳号/非法清单样例）
 docker-compose.yml
 ```
@@ -70,11 +91,17 @@ docker-compose.yml
 自测：基本录制-停止-打包、ZIP 内容校验（本地清单/连续序号/无远端引用/
 片段字节一致/ffmpeg 可解码）、两路并发与慢源不阻塞、缺段 404 失败、窗口
 跳号失败、非法清单拒绝、ENDLIST 自动定界、崩溃（`os._exit`）后重启续录、
-停止边界重启不变、落盘与登记之间崩溃的收养恢复，共 29 项全部通过。
+停止边界重启不变、落盘与登记之间崩溃的收养恢复（26 项），片段地址复用与
+ZIP ffmpeg 解码（3 项），以及消音功能 46 项——请求校验、单/多/跨片段/超尾
+区间逐样本置零、未遮蔽样本与源 PCM 逐字节一致、长录音（40 段）流式构建且
+Python 峰值内存 <4MB、源包缺段/空段/损坏 TS 解码失败、构建中 ZIP 被改写
+检测、失败后无半成品且原 ZIP 照常下载、并发消音、重启清理与 ffmpeg 可播放，
+全部通过。
 
 测试钩子（仅 `RECORDER_TEST_HOOKS=1` 时挂载，compose 不启用）：
 `POST /api/_test/crash` 立即崩溃；`POST /api/_test/arm_after_write/{job}/{seq}`
-在指定片段落盘后、登记前崩溃。
+在指定片段落盘后、登记前崩溃；`POST /api/_test/arm_mute_tamper/{job}`
+让下一次消音构建中途截断源 ZIP；`POST /api/_test/restore_zip/{job}` 恢复。
 
 ## 已知限制
 

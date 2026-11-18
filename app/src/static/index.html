@@ -18,6 +18,10 @@
   .err { color: #c62828; }
   .muted { color: #777; font-size: .85rem; }
   code { background: #f4f4f4; padding: 0 .3rem; border-radius: 4px; }
+  .mute-box { margin-top: .6rem; padding-top: .5rem; border-top: 1px dashed #ccc; max-width: 420px; }
+  .mute-input { width: 100%; box-sizing: border-box; margin: .35rem 0; padding: .4rem; }
+  .mute-list { margin: .4rem 0 0; padding-left: 1.1rem; font-size: .85rem; }
+  .mute-list li { margin-bottom: .25rem; }
 </style>
 </head>
 <body>
@@ -47,6 +51,52 @@
 </div>
 
 <script>
+// Keep half-entered mute intervals across the 2s table refresh.
+const muteDraft = {};
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => (
+    {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+}
+
+function renderMutes(jobId, mutes) {
+  if (!mutes || !mutes.length) return '';
+  const rows = mutes.map(m => {
+    let body;
+    if (m.state === 'ready') {
+      body = `<a href="${m.download_url}">下载消音 WAV</a>`
+        + ` <span class="muted">(${m.muted_samples}/${m.total_samples} 样本置零)</span>`;
+    } else if (m.state === 'failed') {
+      body = `<span class="err">失败: ${esc(m.error)}</span>`;
+    } else {
+      body = `<span class="state-finalizing">处理中…</span>`;
+    }
+    const warn = m.warning ? `<br><span class="muted">${esc(m.warning)}</span>` : '';
+    return `<li>#${m.id} ${body}${warn}</li>`;
+  }).join('');
+  return `<ul class="mute-list">${rows}</ul>`;
+}
+
+async function submitMute(jobId) {
+  const raw = (muteDraft[jobId] || '').trim();
+  if (!raw) { alert('请填写至少一个区间，格式 起点-终点（秒），多个区间用逗号或分号分隔'); return; }
+  const intervals = [];
+  for (const part of raw.split(/[,;，；]/)) {
+    const p = part.trim();
+    if (!p) continue;
+    const m = p.match(/^(\d+(?:\.\d+)?)\s*[-~]\s*(\d+(?:\.\d+)?)$/);
+    if (!m) { alert(`区间格式无法识别: “${p}”，示例: 12.5-18 或 30-33.2`); return; }
+    intervals.push({start: parseFloat(m[1]), end: parseFloat(m[2])});
+  }
+  if (!intervals.length) { alert('请填写至少一个有效区间'); return; }
+  const r = await fetch(`/api/jobs/${jobId}/mute`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({intervals})
+  });
+  if (!r.ok) { alert('消音请求被拒: ' + (await r.json()).detail); return; }
+  refresh();
+}
+
 async function refresh() {
   try {
     const r = await fetch('/api/jobs');
@@ -58,15 +108,33 @@ async function refresh() {
       const win = (j.first_seq === null) ? '—'
         : `${j.first_seq} .. ${j.last_seq}` + (j.stop_seq !== null ? `（止于 ${j.stop_seq}）` : '');
       const miss = (j.missing && j.missing.length) ? `<span class="err">缺段: ${j.missing.join(', ')}</span><br>` : '';
-      const err = j.error ? `<span class="err">${j.error}</span>` : '';
+      const err = j.error ? `<span class="err">${esc(j.error)}</span>` : '';
       let ops = '';
       if (j.state === 'recording') ops += `<button onclick="stopJob(${j.id})">停止</button> `;
-      if (j.state === 'done') ops += `<a href="${j.download_url}">下载 ZIP</a>`;
-      tr.innerHTML = `<td>${j.id}</td><td style="word-break:break-all">${j.url}</td>`
-        + `<td class="state-${j.state}">${j.state}</td>`
-        + `<td>${j.saved} / ${j.expected}</td><td>${win}</td>`
+      if (j.state === 'done') {
+        ops += `<a href="${j.download_url}">下载 ZIP</a>`;
+        const draft = esc(muteDraft[j.id] || '');
+        ops += `<div class="mute-box">
+          <div><b>消音（秒，按录音起点计）</b></div>
+          <input type="text" class="mute-input" data-job="${j.id}"
+                 placeholder="例: 12.5-18, 30-33.2" value="${draft}">
+          <button onclick="submitMute(${j.id})">生成消音 WAV</button>
+          <div id="mutes-${j.id}"></div>
+        </div>`;
+      }
+      tr.innerHTML = `<td>${j.id}</td><td style="word-break:break-all">${esc(j.url)}</td>`
+        + `<td class="state-${esc(j.state)}">${esc(j.state)}</td>`
+        + `<td>${j.saved} / ${j.expected}</td><td>${esc(win)}</td>`
         + `<td>${miss}${err}</td><td>${ops}</td>`;
       tbody.appendChild(tr);
+    }
+    document.querySelectorAll('.mute-input').forEach(inp => {
+      inp.addEventListener('input', e => { muteDraft[inp.dataset.job] = e.target.value; });
+    });
+    for (const j of jobs) {
+      if (j.state !== 'done') continue;
+      const mr = await fetch(`/api/jobs/${j.id}/mutes`);
+      if (mr.ok) document.getElementById(`mutes-${j.id}`).innerHTML = renderMutes(j.id, await mr.json());
     }
   } catch (e) { console.error(e); }
 }

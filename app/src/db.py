@@ -34,6 +34,20 @@ CREATE TABLE IF NOT EXISTS segments (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_segments_job_url
   ON segments(job_id, url) WHERE url IS NOT NULL;
+CREATE TABLE IF NOT EXISTS mute_jobs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id INTEGER NOT NULL,
+  state TEXT NOT NULL DEFAULT 'processing',  -- processing | ready | failed
+  intervals TEXT NOT NULL,                   -- JSON: [{"start": s, "end": e}, ...]
+  output_path TEXT,
+  total_samples INTEGER,
+  muted_samples INTEGER,
+  warning TEXT,
+  error TEXT,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mute_jobs_job ON mute_jobs(job_id);
 """
 
 
@@ -205,3 +219,54 @@ class DB:
                 (job_id,),
             ).fetchall()
             return [r["seq"] for r in rows]
+
+    # ---- mute requests ----
+
+    def insert_mute_job(self, job_id: int, intervals_json: str) -> int:
+        now = time.time()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO mute_jobs(job_id, state, intervals, created_at, updated_at)"
+                " VALUES (?, 'processing', ?, ?, ?)",
+                (job_id, intervals_json, now, now),
+            )
+            return cur.lastrowid
+
+    def get_mute_job(self, mute_id: int):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM mute_jobs WHERE id=?", (mute_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_mute_jobs(self, job_id: int):
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM mute_jobs WHERE job_id=? ORDER BY id", (job_id,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def processing_mute_jobs(self):
+        """Mute requests whose worker never reported a result (e.g. restarted)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM mute_jobs WHERE state='processing' ORDER BY id"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def mute_job_ready(self, mute_id: int, output_path: str,
+                       total_samples: int, muted_samples: int, warning):
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE mute_jobs SET state='ready', output_path=?, total_samples=?,"
+                " muted_samples=?, warning=?, error=NULL, updated_at=? WHERE id=?",
+                (output_path, total_samples, muted_samples, warning, time.time(), mute_id),
+            )
+
+    def mute_job_failed(self, mute_id: int, error: str):
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE mute_jobs SET state='failed', error=?, output_path=NULL,"
+                " updated_at=? WHERE id=?",
+                (error, time.time(), mute_id),
+            )

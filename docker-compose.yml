@@ -6,6 +6,11 @@ services:
       SEGMENT_DURATION: "2"
     ports:
       - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status==200 else 1)"]
+      interval: 5s
+      timeout: 4s
+      retries: 10
 
   app:
     build: ./app
@@ -16,7 +21,13 @@ services:
     ports:
       - "8000:8000"
     depends_on:
-      - livesource
+      livesource:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/jobs', timeout=3).status==200 else 1)"]
+      interval: 5s
+      timeout: 4s
+      retries: 10
 
 volumes:
   appdata:
